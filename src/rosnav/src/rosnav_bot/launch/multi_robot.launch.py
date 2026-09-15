@@ -98,7 +98,7 @@ import _common  # noqa: E402  (shared with slam_nav.launch.py)
 ROS_DISTRO = _common.ROS_DISTRO
 from launch import LaunchDescription
 from launch.actions import (
-    DeclareLaunchArgument, ExecuteProcess, GroupAction, IncludeLaunchDescription,
+    DeclareLaunchArgument, GroupAction, IncludeLaunchDescription,
     LogInfo, OpaqueFunction, TimerAction,
 )
 from launch.conditions import IfCondition
@@ -386,6 +386,7 @@ def _make_robot_params(
     pkg_share: str,
     initial_pose: dict | None = None,
     nav_map_topic: str = '/map',
+    enable_keepout_filter: bool = False,
 ) -> str:
     """Return a namespaced-for-this-robot copy of a nav2 params file as a temp-file path.
 
@@ -420,6 +421,29 @@ def _make_robot_params(
         .setdefault('static_layer', {})
     )
     static_layer['map_topic'] = nav_map_topic
+
+    # Costmap filters must only be loaded when their matching filter-info
+    # server exists.  Loading them unconditionally makes Nav2 retry forever,
+    # flooding the logs with "Filter mask was not received" warnings.  The
+    # multi-robot launch currently provides an optional keepout server and no
+    # speed-filter server.
+    for costmap_name in ('local_costmap', 'global_costmap'):
+        costmap_params = (
+            params.get(costmap_name, {})
+            .get(costmap_name, {})
+            .get('ros__parameters', {})
+        )
+        plugins = list(costmap_params.get('plugins', []))
+        plugins = [name for name in plugins if name != 'speed_filter']
+        costmap_params.pop('speed_filter', None)
+        if enable_keepout_filter:
+            if 'keepout_filter' not in plugins:
+                plugins.append('keepout_filter')
+        else:
+            plugins = [name for name in plugins if name != 'keepout_filter']
+            costmap_params.pop('keepout_filter', None)
+        costmap_params['plugins'] = plugins
+
     content = yaml.safe_dump(params, sort_keys=False)
     tmp = tempfile.NamedTemporaryFile(
         mode='w', suffix=f'_{robot_ns}.yaml', delete=False, prefix='nav2_mr_')
@@ -569,44 +593,6 @@ def _load_node_params(params_path: str, node_name: str) -> dict:
     return (content.get(node_name) or {}).get('ros__parameters', {})
 
 
-def _initial_pose_pub(robot_ns: str, x: str, y: str, yaw: str) -> ExecuteProcess:
-    yaw_f = float(yaw)
-    qz = math.sin(yaw_f / 2.0)
-    qw = math.cos(yaw_f / 2.0)
-    msg = json.dumps({
-        'header': {'stamp': 'now', 'frame_id': 'map'},
-        'pose': {
-            'pose': {
-                'position': {'x': float(x), 'y': float(y), 'z': 0.0},
-                'orientation': {'z': qz, 'w': qw},
-            },
-            'covariance': [
-                0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.06853891945200942,
-            ],
-        },
-    })
-    return ExecuteProcess(
-        cmd=[
-            'ros2', 'topic', 'pub',
-            '--use-sim-time',
-            '--qos-reliability', 'best_effort',
-            '--wait-matching-subscriptions', '1',
-            '--rate', '1',
-            '--times', '20',
-            '--keep-alive', '1.0',
-            f'/{robot_ns}/initialpose',
-            'geometry_msgs/msg/PoseWithCovarianceStamped',
-            msg,
-        ],
-        output='screen',
-    )
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Main launch builder
 # ──────────────────────────────────────────────────────────────────────────────
@@ -652,6 +638,7 @@ def _build_all(context, pkg_share: str):
     nav2_start_delay = float(LaunchConfiguration('nav2_start_delay').perform(context).strip())
     robot_start_stagger = float(LaunchConfiguration('robot_start_stagger').perform(context).strip())
     amcl_start_delay = float(LaunchConfiguration('amcl_start_delay').perform(context).strip())
+    gs_keepout_mask = LaunchConfiguration('gs_keepout_mask').perform(context).strip()
     robots_json = LaunchConfiguration('robots_json').perform(context).strip()
     drive_type = LaunchConfiguration('drive_type').perform(context).strip().lower()
     robot_model = LaunchConfiguration('robot_model').perform(context).strip().lower()
@@ -899,8 +886,20 @@ def _build_all(context, pkg_share: str):
                 'z': 0.0,
                 'yaw': float(yaw),
             }
-        nav_map_topic = '/map_merged' if explore and slam_mode == 'multi' else '/map'
-        robot_params = _make_robot_params(template_yaml, ns, pkg_share, initial_pose, nav_map_topic)
+        if explore and slam_mode == 'multi':
+            nav_map_topic = '/map_merged'
+        elif explore and merge_scans and len(robots) > 1:
+            nav_map_topic = '/map_fused'
+        else:
+            nav_map_topic = '/map'
+        robot_params = _make_robot_params(
+            template_yaml,
+            ns,
+            pkg_share,
+            initial_pose,
+            nav_map_topic,
+            enable_keepout_filter=bool(gs_keepout_mask),
+        )
         actions.append(LogInfo(msg=f'[multi_robot] {ns}: nav2 params -> {robot_params} (map_topic={nav_map_topic})'))
 
         # Robot State Publisher — frame_prefix + namespace arg makes TF frames unique per robot
@@ -1059,10 +1058,8 @@ def _build_all(context, pkg_share: str):
         robot_stagger = idx * robot_start_stagger
         robot_nav2_delay = nav2_start_delay + robot_stagger
         robot_amcl_delay = amcl_start_delay + robot_stagger
-        initial_pose_delay = robot_amcl_delay + 3.0
         amcl_nav2_delay = robot_amcl_delay + 6.0
         static_amcl_delay = 5.0 + robot_stagger
-        static_initial_pose_delay = static_amcl_delay + 3.0
         static_nav2_delay = static_amcl_delay + 6.0
 
         # Sole {ns}/odom -> {ns}/base_link TF broadcaster (wheel odom + IMU
@@ -1096,45 +1093,52 @@ def _build_all(context, pkg_share: str):
             # Stagger each robot so Nav2 lifecycle activation does not stampede.
             actions.append(LogInfo(
                 msg=f'[multi_robot] {ns}: AMCL t={robot_amcl_delay:.1f}s, '
-                    f'initialpose t={initial_pose_delay:.1f}s, nav2 t={amcl_nav2_delay:.1f}s'))
+                    f'nav2 t={amcl_nav2_delay:.1f}s'))
             per_robot += [
                 TimerAction(period=robot_amcl_delay, actions=[
                     amcl_node,
                     amcl_lc,
                 ]),
-                TimerAction(period=initial_pose_delay, actions=[_initial_pose_pub(ns, map_x, map_y, yaw)]),
                 TimerAction(period=amcl_nav2_delay, actions=[nav2_group, *docking_actions]),
             ]
         else:
             # Pre-built map mode: all robots use AMCL
             actions.append(LogInfo(
                 msg=f'[multi_robot] {ns}: AMCL t={static_amcl_delay:.1f}s, '
-                    f'initialpose t={static_initial_pose_delay:.1f}s, nav2 t={static_nav2_delay:.1f}s'))
+                    f'nav2 t={static_nav2_delay:.1f}s'))
             per_robot += [
                 TimerAction(period=static_amcl_delay, actions=[
                     amcl_node,
                     amcl_lc,
                 ]),
-                TimerAction(period=static_initial_pose_delay, actions=[_initial_pose_pub(ns, map_x, map_y, yaw)]),
                 TimerAction(period=static_nav2_delay, actions=[nav2_group, *docking_actions]),
             ]
 
         actions.append(GroupAction(per_robot))
 
-    # ── Auxiliary-scan map fusion (opt-in, merge_scans:=true) ──────────────────
+    # ── Auxiliary-scan map fusion (merge_scans:=true) ─────────────────────────
     # robot1 drives slam_toolbox exclusively (see mapper_params_multirobot.yaml);
     # every other robot only localises via AMCL, so its scans never reach /map.
     # This node layers those robots' scans into cells slam_toolbox still marks
-    # unknown, publishing /map_fused for consumers that opt in — it never
-    # touches slam_toolbox, AMCL, or /map itself. Default (merge_scans:=false)
-    # leaves the existing SLAM/localisation pipeline completely untouched.
+    # unknown, publishing /map_fused for navigation consumers — it never
+    # touches slam_toolbox, AMCL, or /map itself.
     frontier_map_topic = '/map_merged' if explore and slam_mode == 'multi' else '/map'
     if explore and merge_scans and slam_mode == 'single':
         aux_robots = ','.join(r['name'] for r in robots[1:])
-        frontier_map_topic = '/map_fused'
         if aux_robots:
+            # Do not start the CPU-intensive scan fusion while the last AMCL
+            # and Nav2 lifecycle transitions are still running.  On modest
+            # machines that can make AMCL's configure service time out and
+            # leave the auxiliary robot permanently inactive.
+            fusion_start_delay = max(
+                20.0,
+                amcl_start_delay
+                + (len(robots) - 1) * robot_start_stagger
+                + 12.0,
+            )
+            frontier_map_topic = '/map_fused'
             actions.append(TimerAction(
-                period=20.0,
+                period=fusion_start_delay,
                 actions=[Node(
                     package='rosnav_bot',
                     executable='map_fusion.py',
@@ -1146,7 +1150,8 @@ def _build_all(context, pkg_share: str):
                         'output_topic': frontier_map_topic,
                     }])]))
             actions.append(LogInfo(
-                msg=f'[multi_robot] map_fusion will start at t=20s fusing [{aux_robots}] -> {frontier_map_topic}'))
+                msg=f'[multi_robot] map_fusion will start at t={fusion_start_delay:.1f}s '
+                    f'fusing [{aux_robots}] -> {frontier_map_topic}'))
     elif explore and merge_scans and slam_mode == 'multi':
         actions.append(LogInfo(
             msg='[multi_robot] merge_scans ignored in slam_mode:=multi; using /map_merged from map_merge_known'))
@@ -1155,7 +1160,12 @@ def _build_all(context, pkg_share: str):
     robot_ns_list = ','.join(r['name'] for r in robots)
     robot_namespaces = [r['name'] for r in robots]
     if explore:
-        explore_delay = 22.0 if slam_mode == 'multi' else (21.0 if merge_scans else 20.0)
+        if slam_mode == 'multi':
+            explore_delay = 22.0
+        elif merge_scans and len(robots) > 1:
+            explore_delay = fusion_start_delay + 1.0
+        else:
+            explore_delay = 20.0
         if explorer_backend == 'builtin':
             actions.append(TimerAction(
                 period=explore_delay,
@@ -1165,6 +1175,7 @@ def _build_all(context, pkg_share: str):
                     name='frontier_coordinator',
                     output='screen',
                     parameters=[{
+                        'use_sim_time': True,
                         'robot_namespaces': robot_ns_list,
                         'map_save_path': map_prefix,
                         'map_topic': frontier_map_topic,
@@ -1246,7 +1257,6 @@ def _build_all(context, pkg_share: str):
     # fleet — filter_info_topic is an absolute /gs/costmap_filter_info topic,
     # untouched by _common.namespace_nav2_params(), so every robotN's costmaps
     # pick it up without a per-robot instance. See concepts.md §28.
-    gs_keepout_mask = LaunchConfiguration('gs_keepout_mask').perform(context).strip()
     if gs_keepout_mask:
         gs_keepout_filter_params = os.path.join(pkg_share, 'config', 'gs_keepout_filter.yaml')
         actions.append(TimerAction(
@@ -1427,10 +1437,10 @@ def generate_launch_description():
             description='Optional exact robot list JSON, e.g. '
                         '\'[{"name":"robot1","x":-2,"y":-1},{"name":"robot2","x":-0.8,"y":-1}]\''),
         DeclareLaunchArgument(
-            'merge_scans', default_value='false',
+            'merge_scans', default_value='true',
             description='true = fuse non-SLAM robots\' scans into unknown /map cells '
                         '(published as /map_fused) so the fleet maps faster than '
-                        'robot1 alone. Opt-in; does not touch SLAM or AMCL.'),
+                        'robot1 alone; false uses only robot1 for mapping.'),
         DeclareLaunchArgument(
             'slam_mode', default_value='single',
             description='single = robot1 SLAM + AMCL for other robots; '

@@ -33,16 +33,17 @@ politique DRL (voir drl_allocator_node.py -> publish sur
 """
 
 import json
-import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import String
-from nav_msgs.msg import Odometry
+import tf2_ros
 
 from warehouse_marl.warehouse_graph import build_demo_warehouse
+from warehouse_marl.warehouse_graph import WarehouseGraph
 
 
 @dataclass
@@ -53,6 +54,7 @@ class TaskState:
     bids: Dict[str, float] = field(default_factory=dict)   # robot_id -> cost
     deadline: float = 0.0          # timestamp apres lequel on cloture le vote
     assigned_to: Optional[str] = None
+    bid_at: float = 0.0
 
 
 class ConsensusNode(Node):
@@ -63,12 +65,19 @@ class ConsensusNode(Node):
         self.declare_parameter('robot_id', 'robot1')
         self.declare_parameter('bidding_window_sec', 1.5)
         self.declare_parameter('max_concurrent_tasks', 1)
+        self.declare_parameter('bid_delay_sec', 0.2)
+        self.declare_parameter('map_origin_x', -1.5)
+        self.declare_parameter('map_origin_y', -1.0)
 
         self.robot_id = self.get_parameter('robot_id').value
         self.bidding_window = self.get_parameter('bidding_window_sec').value
         self.max_concurrent = self.get_parameter('max_concurrent_tasks').value
+        self.bid_delay = float(self.get_parameter('bid_delay_sec').value)
 
-        self.graph = build_demo_warehouse()
+        self.graph = build_demo_warehouse(
+            float(self.get_parameter('map_origin_x').value),
+            float(self.get_parameter('map_origin_y').value),
+        )
         self.current_pose = (0.0, 0.0)
         self.current_node = None
         self.active_tasks: List[str] = []
@@ -78,9 +87,8 @@ class ConsensusNode(Node):
         self.drl_bias: Dict[str, float] = {}
 
         # --- Abonnements ---
-        self.create_subscription(
-            Odometry, f'/{self.robot_id}/odom', self._on_odom, 10
-        )
+        self._tf = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf, self)
         self.create_subscription(
             String, '/warehouse/tasks/new', self._on_new_task, 10
         )
@@ -89,6 +97,12 @@ class ConsensusNode(Node):
         )
         self.create_subscription(
             String, '/warehouse/consensus/bid_bias', self._on_drl_bias, 10
+        )
+        self.create_subscription(
+            String, '/warehouse/graph_state', self._on_graph_state, 10
+        )
+        self.create_subscription(
+            String, '/warehouse/tasks/status', self._on_task_status, 10
         )
 
         # --- Publications ---
@@ -99,12 +113,24 @@ class ConsensusNode(Node):
 
         # Boucle de cloture des encheres (verifie les deadlines)
         self.create_timer(0.2, self._check_deadlines)
+        self.create_timer(0.2, self._update_pose)
 
         self.get_logger().info(f"[{self.robot_id}] ConsensusNode demarre.")
 
     # ------------------------------------------------------------------ #
-    def _on_odom(self, msg: Odometry):
-        self.current_pose = (msg.pose.pose.position.x, msg.pose.pose.position.y)
+    def _now(self) -> float:
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def _update_pose(self):
+        try:
+            transform = self._tf.lookup_transform(
+                'map', f'{self.robot_id}/base_link', rclpy.time.Time())
+        except Exception:
+            return
+        self.current_pose = (
+            transform.transform.translation.x,
+            transform.transform.translation.y,
+        )
         # Snap simplifie sur le noeud le plus proche
         best, best_d = None, float('inf')
         for nid, data in self.graph.G.nodes(data=True):
@@ -130,6 +156,27 @@ class ConsensusNode(Node):
                 task_id = key[: -len(suffix)]
                 self.drl_bias[task_id] = value
 
+    def _on_graph_state(self, msg: String):
+        try:
+            self.graph = WarehouseGraph.from_json(msg.data)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            self.get_logger().warn('Etat du graphe mal forme; mise a jour ignoree.')
+
+    def _on_task_status(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            terminal = data['state'] in (
+                'succeeded', 'failed', 'rejected', 'canceled')
+            task_id = data['task_id']
+        except (json.JSONDecodeError, KeyError):
+            return
+        if not terminal:
+            return
+        if data['robot_id'] == self.robot_id:
+            self.release_task(task_id)
+        self.tasks.pop(task_id, None)
+        self.drl_bias.pop(task_id, None)
+
     # ------------------------------------------------------------------ #
     def _on_new_task(self, msg: String):
         try:
@@ -140,24 +187,23 @@ class ConsensusNode(Node):
         except (json.JSONDecodeError, KeyError):
             return
 
+        now = self._now()
         if task_id in self.tasks:
-            return  # deja connue
-
-        deadline = time.time() + self.bidding_window
-        self.tasks[task_id] = TaskState(
-            task_id=task_id, target_node=target_node,
-            priority=priority, deadline=deadline
-        )
-
-        # Ne participe pas si l'agent est deja sature
-        if len(self.active_tasks) >= self.max_concurrent:
-            return
-
-        cost = self._compute_bid_cost(target_node, task_id)
-        if cost == float('inf'):
-            return  # pas de chemin -> ne peut pas enchérir
-
-        self._publish_bid(task_id, cost)
+            # A bid from another participant can arrive before /tasks/new.
+            task = self.tasks[task_id]
+            if task.target_node != '?':
+                return
+            task.target_node = target_node
+            task.priority = priority
+            task.deadline = now + self.bidding_window
+            task.bid_at = now + self.bid_delay
+        else:
+            self.tasks[task_id] = TaskState(
+                task_id=task_id, target_node=target_node,
+                priority=priority,
+                deadline=now + self.bidding_window,
+                bid_at=now + self.bid_delay,
+            )
 
     def _compute_bid_cost(self, target_node: str, task_id: str) -> float:
         """Cout = longueur du plus court chemin dynamique (distance +
@@ -182,7 +228,7 @@ class ConsensusNode(Node):
             'task_id': task_id,
             'robot_id': self.robot_id,
             'cost': cost,
-            'stamp': time.time(),
+            'stamp': self._now(),
         }
         msg = String()
         msg.data = json.dumps(payload)
@@ -205,16 +251,24 @@ class ConsensusNode(Node):
             # on cree une entree minimale, la deadline sera fixee a reception
             # de /warehouse/tasks/new.
             self.tasks[task_id] = TaskState(
-                task_id=task_id, target_node='?', deadline=time.time() + self.bidding_window
+                task_id=task_id, target_node='?',
+                deadline=self._now() + self.bidding_window,
+                bid_at=self._now() + self.bid_delay,
             )
         self.tasks[task_id].bids[robot_id] = cost
 
     # ------------------------------------------------------------------ #
     def _check_deadlines(self):
-        now = time.time()
+        now = self._now()
         for task_id, task in list(self.tasks.items()):
             if task.assigned_to is not None or task.deadline == 0.0:
                 continue
+            if (self.robot_id not in task.bids and task.target_node != '?' and
+                    now >= task.bid_at and
+                    len(self.active_tasks) < self.max_concurrent):
+                cost = self._compute_bid_cost(task.target_node, task_id)
+                if cost != float('inf'):
+                    self._publish_bid(task_id, cost)
             if now < task.deadline:
                 continue
 
@@ -242,7 +296,7 @@ class ConsensusNode(Node):
             'task_id': task.task_id,
             'robot_id': self.robot_id,
             'target_node': task.target_node,
-            'stamp': time.time(),
+            'stamp': self._now(),
         }
         msg = String()
         msg.data = json.dumps(payload)
@@ -260,11 +314,12 @@ def main(args=None):
     node = ConsensusNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

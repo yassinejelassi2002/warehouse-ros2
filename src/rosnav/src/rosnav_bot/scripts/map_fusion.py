@@ -94,7 +94,9 @@ class MapFusion(Node):
                 LaserScan, f'/{ns}/scan',
                 lambda msg, ns=ns: self._scan_cb(ns, msg), 5)
 
-        self._pub = self.create_publisher(OccupancyGrid, output_topic, 1)
+        # Late-starting Nav2 and task nodes need the latest fused grid just as
+        # they do for a normal map_server / slam_toolbox map.
+        self._pub = self.create_publisher(OccupancyGrid, output_topic, _MAP_QOS)
         self.create_timer(1.0 / publish_rate, self._publish_fused)
 
         self.get_logger().info(

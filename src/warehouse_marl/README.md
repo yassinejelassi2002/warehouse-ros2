@@ -45,7 +45,13 @@ dynamique, RFID, consensus distribue, allocation par DRL.
                                   │ /warehouse/consensus/bids
                                   │ /warehouse/consensus/assignments
                                   ▼
-                       Nav2 (via mission_server / fleet_manager de rosnav)
+                  ┌───────────────────────────┐
+                  │ mission_executor_node      │
+                  │ files + etat des taches   │
+                  └──────────────┬────────────┘
+                                 │ /robotN/navigate_to_pose
+                                 ▼
+                                Nav2
 ```
 
 ## Installation
@@ -55,12 +61,16 @@ dynamique, RFID, consensus distribue, allocation par DRL.
 sudo apt install ros-$ROS_DISTRO-rclpy ros-$ROS_DISTRO-std-msgs \
                   ros-$ROS_DISTRO-nav-msgs ros-$ROS_DISTRO-geometry-msgs
 
-# Dependances Python pour la partie DRL
-pip install networkx gymnasium torch numpy --break-system-packages
+# Environnement Python partageant les paquets ROS systeme
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+
+# Dependances optionnelles pour entrainer/utiliser le DQN
+python -m pip install gymnasium torch
 
 # Construction du workspace
-cd ~/warehouse_marl_ws
-colcon build --symlink-install
+cd ~/chaimaws/src/warehouse-ros2
+python -m colcon build --symlink-install --packages-select rosnav_bot warehouse_marl
 source install/setup.bash
 ```
 
@@ -79,40 +89,56 @@ exploitable pour les figures de ton memoire).
 ### 2) Lancer la simulation (terminal 1, package rosnav)
 
 ```bash
-ros2 launch diff_drive_robot multi_robot.launch.py world:=warehouse explore:=false
+ros2 launch rosnav_bot multi_robot.launch.py \
+    world:=warehouse robot_count:=2 explore:=true slam_mode:=single \
+    merge_scans:=true fleet_mgmt:=false
 ```
 
 ### 3) Lancer la couche de coordination (terminal 2, ce package)
 
 ```bash
 ros2 launch warehouse_marl warehouse_marl.launch.py \
-    robot_names:="['robot1','robot2','robot3']" \
-    drl_mode:=hybrid \
-    model_path:=$(pwd)/warehouse_dqn.pt
+    robot_names:="['robot1','robot2']" \
+    drl_mode:=heuristic \
+    map_origin_x:=-1.5 map_origin_y:=-1.0
 ```
+
+Le mode `heuristic` est le point de depart valide : il ne depend pas d'un
+modele appris. Les coordonnees `map_origin_x/y` doivent etre celles du spawn
+Gazebo de `robot1`; dans le monde `warehouse`, la validation de collision
+deplace le spawn demande `(-2.0, -1.0)` vers le point libre
+`(-1.5, -1.0)`, d'ou les valeurs ci-dessus. Le generateur attend que des points de picking
+soient reellement libres et connus dans `/map_fused` (`/map` sert de repli), puis les missions suspendent
+temporairement les objectifs d'exploration pendant qu'elles utilisent Nav2.
+
+Apres une modification/reconstruction de `rosnav_bot`, relancer une fois la
+simulation de base afin que le `frontier_coordinator` charge ce mecanisme de
+pause.
 
 ### 4) Observer le systeme
 
 ```bash
 ros2 topic echo /warehouse/tasks/new
 ros2 topic echo /warehouse/consensus/assignments
+ros2 topic echo /warehouse/tasks/status
 ros2 topic echo /rfid/detections
 ros2 topic echo /warehouse/graph_state
 ```
 
 ## Modes d'allocation comparables (pour ton evaluation experimentale)
 
-- **Heuristique pure** : lance uniquement les `consensus_node` (sans
-  `drl_allocator_node`) -> decision par plus court chemin + priorite.
+- **Heuristique pure** (`drl_mode:=heuristic`, recommande pour valider la
+  simulation) : consensus par plus court chemin + priorite, sans modele.
 - **DRL direct** : `drl_mode:=direct` -> allocation centralisee par
-  argmax des Q-values (rapide, mais reintroduit un point central).
-- **Hybride (recommande)** : `drl_mode:=hybrid` -> le DRL orient les
-  encheres, la decision finale reste distribuee (consensus).
+  argmax des Q-values (necessite un `model_path` valide).
+- **Hybride** : `drl_mode:=hybrid` -> le DRL oriente les encheres, la
+  decision finale reste distribuee. Sans modele valide, aucun poids aleatoire
+  n'est utilise et le consensus reste heuristique.
 
-Mesure suggeree pour tes resultats : temps moyen entre creation de la
-tache (`created_at` dans le payload JSON) et confirmation d'assignation
-(`stamp` dans `/warehouse/consensus/assignments`), a comparer entre les
-3 modes, sur plusieurs runs avec seeds differentes.
+Le topic `/warehouse/tasks/status` publie `queued`, `navigating`, `retrying`,
+et un etat terminal (`succeeded`, `failed`, `rejected`, `canceled`) avec
+`elapsed_sec`. Il permet de mesurer le temps physique creation -> fin, plus
+pertinent que le seul temps d'allocation.
 
 ## Limites connues / pistes d'extension pour le memoire
 

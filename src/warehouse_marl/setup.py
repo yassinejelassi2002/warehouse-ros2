@@ -26,7 +26,7 @@ setup(
         'consensus, allocation de taches par DRL) pour entrepot Industry 4.0.'
     ),
     license='Apache-2.0',
-    tests_require=['pytest'],
+    extras_require={'test': ['pytest']},
     entry_points={
         'console_scripts': [
             # Couche capteurs / graphe
@@ -37,6 +37,7 @@ setup(
             # Couche allocation de taches par DRL
             'drl_allocator_node = warehouse_marl.drl_allocator_node:main',
             'task_generator_node = warehouse_marl.task_generator_node:main',
+            'mission_executor_node = warehouse_marl.mission_executor_node:main',
             # Entrainement hors-ligne du modele DRL (pas un noeud ROS2)
             'train_drl = warehouse_marl.drl.train_drl:main',
         ],

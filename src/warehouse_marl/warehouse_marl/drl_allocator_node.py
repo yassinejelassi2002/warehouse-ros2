@@ -29,6 +29,7 @@ import os
 
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import String
 
@@ -58,20 +59,29 @@ class DRLAllocatorNode(Node):
         obs_dim = len(self.robot_names) * 3 + 1
         self.agent = DQNAgent(obs_dim=obs_dim, n_actions=len(self.robot_names))
 
-        if os.path.exists(self.model_path):
+        self.model_loaded = os.path.isfile(self.model_path)
+        if self.model_loaded:
             self.agent.load(self.model_path)
             self.get_logger().info(f"Modele DRL charge depuis {self.model_path}")
         else:
-            self.get_logger().warn(
-                f"Modele {self.model_path} introuvable : le noeud tourne avec "
-                f"des poids ALEATOIRES (entraine d'abord via train_drl)."
-            )
+            message = (
+                f"Modele {self.model_path} introuvable; aucun poids aleatoire "
+                f"ne sera utilise. Entraine d abord via train_drl.")
+            if self.mode == 'direct':
+                raise FileNotFoundError(message)
+            self.get_logger().warn(message + ' Consensus heuristique conserve.')
 
         self.create_subscription(
             String, '/warehouse/graph_state', self._on_graph_state, 10
         )
         self.create_subscription(
             String, '/warehouse/consensus/assignments', self._on_assignment, 10
+        )
+        self.create_subscription(
+            String, '/warehouse/tasks/direct_assignment', self._on_assignment, 10
+        )
+        self.create_subscription(
+            String, '/warehouse/tasks/status', self._on_task_status, 10
         )
         self.create_subscription(
             String, '/warehouse/tasks/new', self._on_new_task, 10
@@ -103,8 +113,19 @@ class DRLAllocatorNode(Node):
         if robot_id in self.agent_load:
             self.agent_load[robot_id] += 1
 
+    def _on_task_status(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            robot_id = data['robot_id']
+            terminal = data['state'] in (
+                'succeeded', 'failed', 'rejected', 'canceled')
+        except (json.JSONDecodeError, KeyError):
+            return
+        if terminal and robot_id in self.agent_load:
+            self.agent_load[robot_id] = max(0, self.agent_load[robot_id] - 1)
+
     def _on_new_task(self, msg: String):
-        if self.graph is None:
+        if self.graph is None or not self.model_loaded:
             return  # graphe pas encore recu
 
         try:
@@ -180,11 +201,12 @@ def main(args=None):
     node = DRLAllocatorNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

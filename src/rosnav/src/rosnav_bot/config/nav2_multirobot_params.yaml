@@ -190,7 +190,9 @@ controller_server:
         cost_power: 1
         cost_weight: 3.81
         critical_cost: 300.0
-        consider_footprint: true
+        # The fleet costmaps model the robot with robot_radius, not a polygon.
+        # MPPI must therefore use circular-radius collision checking.
+        consider_footprint: false
         collision_cost: 1000000.0
         near_goal_distance: 1.0
         trajectory_point_step: 2

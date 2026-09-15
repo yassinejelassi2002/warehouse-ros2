@@ -10,7 +10,7 @@ Comme il n'existe pas de plugin Gazebo RFID standard, ce noeud simule le
 comportement physique d'un lecteur RFID embarque sur chaque robot :
   - chaque noeud du graphe (rack, station) porte un tag RFID virtuel
     associe a une position (x, y) et un rayon de lecture ;
-  - le noeud ecoute l'odometrie de chaque robot ;
+  - le noeud lit la pose TF de chaque robot dans la carte partagee ;
   - quand un robot entre dans le rayon de lecture d'un tag, une detection
     est publiee sur /rfid/detections (JSON), avec un bruit de detection
     configurable (taux de faux-negatifs) pour rester realiste et permettre
@@ -26,9 +26,10 @@ import math
 import random
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import String
-from nav_msgs.msg import Odometry
+import tf2_ros
 
 from warehouse_marl.warehouse_graph import build_demo_warehouse
 
@@ -42,6 +43,9 @@ class RFIDSensorNode(Node):
         self.declare_parameter('read_radius_m', 0.8)
         self.declare_parameter('detection_noise', 0.05)  # taux de faux-negatifs
         self.declare_parameter('min_republish_period_sec', 2.0)
+        self.declare_parameter('pose_update_period_sec', 0.2)
+        self.declare_parameter('map_origin_x', -1.5)
+        self.declare_parameter('map_origin_y', -1.0)
 
         self.robot_names = self.get_parameter('robot_names').value
         self.read_radius = self.get_parameter('read_radius_m').value
@@ -50,16 +54,19 @@ class RFIDSensorNode(Node):
 
         # Reutilise la meme topologie que graph_publisher_node pour que les
         # tags RFID simules correspondent aux memes noeuds physiques.
-        self.graph = build_demo_warehouse()
+        self.graph = build_demo_warehouse(
+            float(self.get_parameter('map_origin_x').value),
+            float(self.get_parameter('map_origin_y').value),
+        )
 
         self._last_pose = {name: (0.0, 0.0) for name in self.robot_names}
         self._last_detection_time = {}  # (robot, node) -> stamp
 
-        for name in self.robot_names:
-            self.create_subscription(
-                Odometry, f'/{name}/odom',
-                lambda msg, n=name: self._on_odom(n, msg), 10
-            )
+        self._tf = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf, self)
+        self.create_timer(
+            float(self.get_parameter('pose_update_period_sec').value),
+            self._update_robot_poses)
 
         self.rfid_pub = self.create_publisher(String, '/rfid/detections', 10)
 
@@ -68,9 +75,20 @@ class RFIDSensorNode(Node):
             f"rayon de lecture {self.read_radius} m, bruit {self.noise*100:.0f}%."
         )
 
-    def _on_odom(self, robot_name: str, msg: Odometry):
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
+    def _update_robot_poses(self):
+        for robot_name in self.robot_names:
+            try:
+                transform = self._tf.lookup_transform(
+                    'map', f'{robot_name}/base_link', rclpy.time.Time())
+            except Exception:
+                continue
+            self._on_pose(
+                robot_name,
+                transform.transform.translation.x,
+                transform.transform.translation.y,
+            )
+
+    def _on_pose(self, robot_name: str, x: float, y: float):
         self._last_pose[robot_name] = (x, y)
 
         for node_id, data in self.graph.G.nodes(data=True):
@@ -115,11 +133,12 @@ def main(args=None):
     node = RFIDSensorNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

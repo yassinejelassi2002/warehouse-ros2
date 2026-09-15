@@ -3,8 +3,8 @@ graph_publisher_node.py
 ------------------------
 Noeud ROS2 qui :
   1) construit/maintient le WarehouseGraph (graphe dynamique) ;
-  2) ecoute l'odometrie de chaque robot de la flotte (/robotX/odom) pour
-     mettre a jour l'occupation des noeuds et la congestion des aretes ;
+  2) lit la pose TF ``map -> robotX/base_link`` pour mettre a jour
+     l'occupation des noeuds et la congestion des aretes ;
   3) ecoute les detections RFID publiees par rfid_sensor_node sur
      /rfid/detections pour recaler la position logique d'un robot sur un
      noeud precis du graphe (RFID = verite terrain, l'odometrie derive) ;
@@ -20,9 +20,10 @@ import json
 import math
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import String
-from nav_msgs.msg import Odometry
+import tf2_ros
 
 from warehouse_marl.warehouse_graph import build_demo_warehouse
 
@@ -34,25 +35,27 @@ class GraphPublisherNode(Node):
 
         self.declare_parameter('robot_names', ['robot1', 'robot2', 'robot3'])
         self.declare_parameter('publish_period_sec', 1.0)
+        self.declare_parameter('pose_update_period_sec', 0.2)
         self.declare_parameter('node_snap_radius', 1.5)  # m
+        self.declare_parameter('map_origin_x', -1.5)
+        self.declare_parameter('map_origin_y', -1.0)
 
         self.robot_names = self.get_parameter('robot_names').value
         period = self.get_parameter('publish_period_sec').value
         self.snap_radius = self.get_parameter('node_snap_radius').value
 
-        self.graph = build_demo_warehouse()
+        self.graph = build_demo_warehouse(
+            float(self.get_parameter('map_origin_x').value),
+            float(self.get_parameter('map_origin_y').value),
+        )
         self._robot_last_node = {name: None for name in self.robot_names}
+        self._tf = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf, self)
 
-        # Abonnement a l'odometrie de chaque robot
-        self._odom_subs = []
+        # Robot odometry is local to each spawn and cannot be compared in one
+        # warehouse graph.  The shared map TF is the common source of truth.
         for name in self.robot_names:
-            topic = f'/{name}/odom'
-            sub = self.create_subscription(
-                Odometry, topic,
-                lambda msg, n=name: self._on_odom(n, msg), 10
-            )
-            self._odom_subs.append(sub)
-            self.get_logger().info(f"Abonne a {topic}")
+            self.get_logger().info(f"Suit TF map -> {name}/base_link")
 
         # Abonnement aux detections RFID (recalage position logique)
         self.create_subscription(
@@ -61,6 +64,9 @@ class GraphPublisherNode(Node):
 
         # Publication de l'etat du graphe
         self.graph_pub = self.create_publisher(String, '/warehouse/graph_state', 10)
+        self.create_timer(
+            float(self.get_parameter('pose_update_period_sec').value),
+            self._update_robot_poses)
         self.create_timer(period, self._publish_graph)
 
         self.get_logger().info(
@@ -77,9 +83,20 @@ class GraphPublisherNode(Node):
                 best, best_d = nid, d
         return best, best_d
 
-    def _on_odom(self, robot_name: str, msg: Odometry):
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
+    def _update_robot_poses(self):
+        for robot_name in self.robot_names:
+            try:
+                transform = self._tf.lookup_transform(
+                    'map', f'{robot_name}/base_link', rclpy.time.Time())
+            except Exception:
+                continue
+            self._on_pose(
+                robot_name,
+                transform.transform.translation.x,
+                transform.transform.translation.y,
+            )
+
+    def _on_pose(self, robot_name: str, x: float, y: float):
 
         nearest, dist = self._nearest_node(x, y)
         if nearest is None or dist > self.snap_radius:
@@ -93,7 +110,7 @@ class GraphPublisherNode(Node):
         if prev is not None:
             self.graph.set_node_occupancy(prev, robot_name, occupied=False)
             if self.graph.G.has_edge(prev, nearest):
-                self.graph.update_congestion(prev, nearest, delta=-0.5)
+                self.graph.update_congestion(prev, nearest, delta=1.0)
         self.graph.set_node_occupancy(nearest, robot_name, occupied=True)
         self._robot_last_node[robot_name] = nearest
 
@@ -127,6 +144,9 @@ class GraphPublisherNode(Node):
             )
 
     def _publish_graph(self):
+        # Congestion is recent-use memory, so let it decay over time.
+        for u, v in self.graph.G.edges:
+            self.graph.update_congestion(u, v, delta=-0.1)
         msg = String()
         msg.data = self.graph.to_json()
         self.graph_pub.publish(msg)
@@ -137,11 +157,12 @@ def main(args=None):
     node = GraphPublisherNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

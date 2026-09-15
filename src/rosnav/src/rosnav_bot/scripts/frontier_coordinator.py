@@ -46,6 +46,11 @@ Published topics
 ----------------
 /exploration/stats    std_msgs/String JSON status snapshot
 /exploration/markers  visualization_msgs/MarkerArray debug markers
+
+Subscribed coordination topic
+------------------------------
+/warehouse/missions_active  std_msgs/Bool; pauses new frontier assignments
+                            while warehouse task missions own Nav2.
 """
 
 import json
@@ -67,7 +72,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.action import NavigateToPose
-from std_msgs.msg import ColorRGBA, String
+from std_msgs.msg import Bool, ColorRGBA, String
 
 _MAP_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
@@ -202,6 +207,7 @@ class FrontierCoordinator(Node):
         self._tf_ready: dict[str, bool] = {r: False for r in self._robots}
         self._last_tf_wait_warn: dict[str, float] = {r: 0.0 for r in self._robots}
         self._last_assignment_cycle_log = 0.0
+        self._missions_active = False
 
         # Per-robot tracking
         self._state:    dict[str, _State]                    = {r: _State.IDLE for r in self._robots}
@@ -221,6 +227,8 @@ class FrontierCoordinator(Node):
 
         self.get_logger().info(f'Watching Nav2 servers: {self._robots}')
         self.create_subscription(OccupancyGrid, map_topic, self._map_cb, _MAP_QOS)
+        self.create_subscription(
+            Bool, '/warehouse/missions_active', self._mission_state_cb, _MAP_QOS)
         if self._validate_costmap and self._costmap_suffix:
             for r in self._robots:
                 topic = f'/{r}/{self._costmap_suffix}'
@@ -248,6 +256,14 @@ class FrontierCoordinator(Node):
     def _costmap_cb(self, msg: OccupancyGrid, robot: str):
         self._costmaps[robot] = msg
 
+    def _mission_state_cb(self, msg: Bool):
+        active = bool(msg.data)
+        if active != self._missions_active:
+            state = 'pausee' if active else 'reprise'
+            self.get_logger().info(
+                f'Exploration {state}: missions entrepot actives={active}.')
+        self._missions_active = active
+
     # ------------------------------------------------------------------
     def _cycle(self):
         if self._map is None:
@@ -257,6 +273,13 @@ class FrontierCoordinator(Node):
         elapsed = self._elapsed_sec()
         robot_positions = self._robot_positions(elapsed)
         self._refresh_nav_servers()
+        if self._missions_active:
+            # An incoming warehouse goal preempts any in-flight frontier goal.
+            # Do not issue a replacement until the mission executor releases
+            # ownership of the Nav2 action servers.
+            self._publish_stats()
+            self._publish_markers([], robot_positions)
+            return
         if self._detector in ('wfd', 'rrt') and not robot_positions:
             self.get_logger().debug('Waiting for robot TF before frontier search.')
             self._publish_stats()
