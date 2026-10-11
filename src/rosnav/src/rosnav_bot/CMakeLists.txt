@@ -33,6 +33,8 @@ install(
 install(
   PROGRAMS
     scripts/navigation.py
+    scripts/fleet_obstacles.py
+    scripts/world_to_map.py
     scripts/pid_controller.py
     scripts/llm_nav.py
     scripts/bt_server.py

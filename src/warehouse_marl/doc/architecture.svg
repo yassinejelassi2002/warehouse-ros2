@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 950" width="1400" height="950" font-family="DejaVu Sans, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#3a4250"/>
+    </marker>
+    <style>
+      .band { stroke-width: 1.5; rx: 10; }
+      .bt { font-size: 15px; font-weight: 700; fill: #1f2630; }
+      .box { fill: #ffffff; stroke-width: 1.6; rx: 7; }
+      .h { font-size: 14px; font-weight: 700; fill: #1f2630; }
+      .t { font-size: 12px; fill: #3a4250; }
+      .l { font-size: 11.5px; fill: #3a4250; font-style: italic; }
+      .ar { stroke: #3a4250; stroke-width: 1.6; fill: none; marker-end: url(#a); }
+      .sim { fill: #eef3fa; stroke: #7c9cc8; }     .simb { stroke: #7c9cc8; }
+      .nav { fill: #eef7f0; stroke: #74b086; }     .navb { stroke: #74b086; }
+      .flt { fill: #f5f1fa; stroke: #a08cc4; }     .fltb { stroke: #a08cc4; }
+      .mrl { fill: #fdf4ec; stroke: #e0965a; }     .mrlb { stroke: #e0965a; }
+      .rfid { fill: #fff0e3; stroke: #ff8a3d; }    .rfidb { stroke: #ff8a3d; stroke-width: 2.2; }
+      .mon { fill: #f1f2f4; stroke: #8a929e; }     .monb { stroke: #8a929e; }
+    </style>
+  </defs>
+
+  <rect width="1400" height="950" fill="#fafbfc"/>
+  <text x="20" y="34" font-size="21" font-weight="700" fill="#1f2630">Multi-robot RFID warehouse: system architecture</text>
+  <text x="1380" y="34" font-size="12" fill="#6a7280" text-anchor="end">ROS 2 Jazzy · Gazebo Harmonic · Nav2</text>
+
+  <!-- 1. Simulation -->
+  <rect class="band sim" x="20" y="54" width="1060" height="150"/>
+  <text class="bt" x="34" y="76">1 · Simulation</text>
+  <rect class="box simb" x="40" y="88" width="480" height="100"/>
+  <text class="h" x="56" y="112">Gazebo Harmonic: warehouse world</text>
+  <text class="t" x="56" y="134">Racks, aisles, shelves holding RFID-tagged items</text>
+  <text class="t" x="56" y="153">N robots (3 to 5): differential drive, 2D lidar,</text>
+  <text class="t" x="56" y="172">IMU, depth camera, RFID reader</text>
+  <rect class="box simb" x="610" y="104" width="220" height="68"/>
+  <text class="h" x="626" y="128">ros_gz_bridge</text>
+  <text class="t" x="626" y="150">Gazebo ⇄ ROS 2 topics</text>
+  <path class="ar" d="M520 124 H608"/>
+  <text class="l" x="530" y="118">sensors</text>
+  <path class="ar" d="M610 156 H522"/>
+  <text class="l" x="530" y="172">cmd_vel</text>
+
+  <!-- 2. Per-robot navigation -->
+  <rect class="band nav" x="20" y="224" width="1060" height="186"/>
+  <text class="bt" x="210" y="246">2 · Navigation stack (rosnav_bot), one copy per robot</text>
+  <rect class="box navb" x="40" y="262" width="175" height="120"/>
+  <text class="h" x="54" y="286">EKF odometry</text>
+  <text class="t" x="54" y="308">Wheel speed + IMU</text>
+  <text class="t" x="54" y="326">→ odom frame</text>
+  <rect class="box navb" x="232" y="262" width="205" height="120"/>
+  <text class="h" x="246" y="286">Localization</text>
+  <text class="t" x="246" y="308">robot1: slam_toolbox</text>
+  <text class="t" x="246" y="326">(builds the shared /map)</text>
+  <text class="t" x="246" y="348">Others: AMCL on /map</text>
+  <rect class="box navb" x="454" y="262" width="418" height="120"/>
+  <text class="h" x="470" y="286">Nav2</text>
+  <text class="t" x="470" y="308">BT navigator · NavFn planner · MPPI controller</text>
+  <text class="t" x="470" y="326">Costmaps: lidar + depth + fleet obstacles</text>
+  <text class="t" x="470" y="344">Recovery behaviors (spin, back up, wait)</text>
+  <rect class="box navb" x="889" y="262" width="175" height="120"/>
+  <text class="h" x="903" y="286">Safety output</text>
+  <text class="t" x="903" y="308">Velocity smoother</text>
+  <text class="t" x="903" y="326">→ collision monitor</text>
+  <text class="t" x="903" y="344">→ /robotN/cmd_vel</text>
+  <path class="ar" d="M215 322 H230"/>
+  <path class="ar" d="M437 322 H452"/>
+  <path class="ar" d="M872 322 H887"/>
+  <path class="ar" d="M190 188 V260"/>
+  <text class="l" x="198" y="214">scan · odom · imu (via bridge)</text>
+  <path class="ar" d="M976 262 V214 H800 V174"/>
+
+  <!-- 3. Shared fleet services -->
+  <rect class="band flt" x="20" y="430" width="1060" height="136"/>
+  <text class="bt" x="34" y="452">3 · Shared fleet services</text>
+  <rect class="box fltb" x="40" y="466" width="240" height="86"/>
+  <text class="h" x="54" y="490">Shared /map</text>
+  <text class="t" x="54" y="511">Live SLAM map, or map_server</text>
+  <text class="t" x="54" y="529">(saved, or built from world SDF)</text>
+  <rect class="box fltb" x="300" y="466" width="236" height="86"/>
+  <text class="h" x="314" y="490">Frontier coordinator</text>
+  <text class="t" x="314" y="511">Exploration: one frontier</text>
+  <text class="t" x="314" y="529">goal per robot</text>
+  <rect class="box fltb" x="566" y="466" width="246" height="86"/>
+  <text class="h" x="580" y="490">fleet_obstacles</text>
+  <text class="t" x="580" y="511">Other robots' footprints → costmaps</text>
+  <text class="t" x="580" y="529">(robots are below lidar height)</text>
+  <rect class="box fltb" x="832" y="466" width="232" height="86"/>
+  <text class="h" x="846" y="490">Lifecycle watchdog</text>
+  <text class="t" x="846" y="511">Restarts Nav2 / SLAM /</text>
+  <text class="t" x="846" y="529">map_server nodes if they drop</text>
+  <path class="ar" d="M262 466 V384"/>
+  <path class="ar" d="M490 466 V384"/>
+  <path class="ar" d="M760 466 V384"/>
+  <path class="ar" d="M960 466 V384"/>
+
+  <!-- 4. Coordination, decision & RFID -->
+  <rect class="band mrl" x="20" y="586" width="1060" height="300"/>
+  <text class="bt" x="34" y="608">4 · Multi-agent coordination (MARL), decision &amp; RFID (warehouse_marl)</text>
+  <rect class="box mrlb" x="40" y="622" width="230" height="82"/>
+  <text class="h" x="54" y="646">Dynamic graph</text>
+  <text class="t" x="54" y="667">Racks/aisles = nodes, paths =</text>
+  <text class="t" x="54" y="685">edges, live robots + congestion</text>
+  <rect class="box mrlb" x="40" y="722" width="230" height="82"/>
+  <text class="h" x="54" y="746">Task generator</text>
+  <text class="t" x="54" y="767">Pick/deliver + rfid_scan tasks</text>
+  <text class="t" x="54" y="785">Scans shelves with uncertain stock</text>
+  <rect x="292" y="614" width="282" height="224" rx="9" fill="#fbe6d4" stroke="#c96a2a" stroke-width="1.6" stroke-dasharray="6 4"/>
+  <text x="433" y="830" text-anchor="middle" font-size="13" font-weight="700" fill="#a4521b">MARL: robots = learning agents</text>
+  <rect class="box mrlb" x="306" y="622" width="254" height="82"/>
+  <text class="h" x="320" y="646">Consensus agents ×N</text>
+  <text class="t" x="320" y="667">One per robot: auction (bids),</text>
+  <text class="t" x="320" y="685">conflict resolution, shelf capacity</text>
+  <rect class="box mrlb" x="306" y="722" width="254" height="82"/>
+  <text class="h" x="320" y="746">Learned policy (DRL / DQN)</text>
+  <text class="t" x="320" y="767">Trained offline, biases each</text>
+  <text class="t" x="320" y="785">robot's bids (hybrid / direct)</text>
+  <rect class="box mrlb" x="596" y="622" width="216" height="82"/>
+  <text class="h" x="610" y="646">Mission executor ×N</text>
+  <text class="t" x="610" y="667">Assignment → Nav2 goal,</text>
+  <text class="t" x="610" y="685">reports task status</text>
+  <rect class="box rfidb" x="846" y="622" width="218" height="82"/>
+  <text class="h" x="860" y="646">RFID sensor ×N</text>
+  <text class="t" x="860" y="667">Probabilistic reads: range,</text>
+  <text class="t" x="860" y="685">angle, misses, false reads</text>
+  <rect class="box rfidb" x="846" y="722" width="218" height="82"/>
+  <text class="h" x="860" y="746">Inventory node</text>
+  <text class="t" x="860" y="767">Bayesian belief per shelf</text>
+  <text class="t" x="860" y="785">→ stock estimate + uncertainty</text>
+  <path class="ar" d="M270 663 H304"/>
+  <path class="ar" d="M270 763 Q288 763 300 712"/>
+  <path class="ar" d="M433 722 V706"/>
+  <path class="ar" d="M560 663 H594"/>
+  <path class="ar" d="M955 704 V720"/>
+  <text class="l" x="962" y="716">/rfid/detections</text>
+  <path class="ar" d="M955 804 V858 H155 V806"/>
+  <text class="l" x="945" y="852" text-anchor="end">/rfid/inventory: which shelves need a scan (adaptive decision loop)</text>
+  <path class="ar" d="M704 622 V576 H551 V384"/>
+  <text class="l" x="558" y="420">NavigateToPose</text>
+  <text class="t" x="34" y="876" fill="#6a7280">All links are ROS 2 topics, services and actions: the IoT communication layer between agents, sensors and the dashboard.</text>
+
+  <!-- 5. Monitoring -->
+  <rect class="band mon" x="1100" y="54" width="280" height="832"/>
+  <text class="bt" x="1114" y="76">5 · Monitoring</text>
+  <rect class="box monb" x="1116" y="270" width="248" height="100"/>
+  <text class="h" x="1130" y="294">RViz2</text>
+  <text class="t" x="1130" y="316">Map, robots, paths,</text>
+  <text class="t" x="1130" y="334">costmaps (developer view)</text>
+  <rect class="box monb" x="1116" y="610" width="248" height="100"/>
+  <text class="h" x="1130" y="634">Dashboard server :8080</text>
+  <text class="t" x="1130" y="656">ROS node, HTTP + live events</text>
+  <text class="t" x="1130" y="674">(map, poses, tasks, RFID)</text>
+  <rect class="box rfidb" x="1116" y="750" width="248" height="112"/>
+  <text class="h" x="1130" y="774">Web dashboard (browser)</text>
+  <text class="t" x="1130" y="796">Overview · live map ·</text>
+  <text class="t" x="1130" y="814">missions · RFID reads</text>
+  <path class="ar" d="M1064 322 H1114"/>
+  <path class="ar" d="M1064 663 H1114"/>
+  <path class="ar" d="M1240 710 V748"/>
+
+  <!-- Footer -->
+  <text x="20" y="922" font-size="12.5" fill="#3a4250">One command starts everything: <tspan font-family="DejaVu Sans Mono, monospace">ros2 launch warehouse_marl warehouse_full.launch.py robot_count:=3</tspan>  (Gazebo, navigation, coordination, RFID, RViz, dashboard)</text>
+</svg>

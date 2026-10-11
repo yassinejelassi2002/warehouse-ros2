@@ -8,10 +8,13 @@
 
 amcl:
   ros__parameters:
-    alpha1: 0.2
-    alpha2: 0.2
-    alpha3: 0.2
-    alpha4: 0.2
+    # Odometry noise: wheel+IMU odometry is now accurate to a few cm, so AMCL
+    # can trust it more; 0.2 let particles wander in feature-poor areas
+    # (measured 0.5-0.75 m drift in the empty staging zone).
+    alpha1: 0.1
+    alpha2: 0.1
+    alpha3: 0.1
+    alpha4: 0.1
     alpha5: 0.2
     base_frame_id: "ROBOT_NS/base_link"
     global_frame_id: "map"
@@ -30,6 +33,8 @@ amcl:
     min_particles: 500
     pf_err: 0.05
     pf_z: 0.99
+    # Random-particle relocalization stays OFF: tested at 0.1/0.001, AMCL
+    # jumped 6-12 m to look-alike spots (repeating racks, partial SLAM map).
     recovery_alpha_fast: 0.0
     recovery_alpha_slow: 0.0
     resample_interval: 1
@@ -190,9 +195,9 @@ controller_server:
         cost_power: 1
         cost_weight: 3.81
         critical_cost: 300.0
-        # The fleet costmaps model the robot with robot_radius, not a polygon.
-        # MPPI must therefore use circular-radius collision checking.
-        consider_footprint: false
+        # The costmaps use the robot's real polygon footprint, so MPPI checks
+        # collisions against the full body, not just its centre.
+        consider_footprint: true
         collision_cost: 1000000.0
         near_goal_distance: 1.0
         trajectory_point_step: 2
@@ -229,7 +234,15 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.05
-      robot_radius: 0.22
+      # Real body from robot_core.xacro: chassis x -0.10..0.45, base plate
+      # x +/-0.275, wheels y +/-0.245 (circumscribed radius ~0.53 m). The old
+      # robot_radius 0.22 let the chassis front hit shelves, so robots got
+      # stuck, wheels slipped and odometry/localization drifted by metres.
+      footprint: "[[0.46, 0.25], [0.46, -0.25], [-0.28, -0.25], [-0.28, 0.25]]"
+      # 10 cm safety margin: makes the 0.7 m gaps between rack segments
+      # impassable (robots clipped rack corners there, got stuck with the
+      # wheels spinning, and their odometry/pose drifted by metres).
+      footprint_padding: 0.1
       # keepout_filter is inert until a costmap_filter_info_server publishes
       # /gs/costmap_filter_info (see gs_keepout_filter.yaml + multi_robot.launch.py
       # gs_keepout_mask:=<path>) — safe to always list. Absolute topic (leading
@@ -247,7 +260,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.55
+        inflation_radius: 0.70
       obstacle_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -259,7 +272,19 @@ local_costmap:
         mark_threshold: 0
         combination_method: 1
         # Relative topics auto-namespace under /robotN/
-        observation_sources: scan points depth
+        observation_sources: scan points depth fleet
+        fleet:
+          # Other robots' footprints (warehouse_marl fleet_obstacles_node): the
+          # lidars pass over the robot bodies, so robots are otherwise invisible
+          # to each other. Range is measured from the cloud's frame (map) origin.
+          topic: fleet_obstacles
+          clearing: False
+          marking: True
+          data_type: "PointCloud2"
+          obstacle_max_range: 60.0
+          obstacle_min_range: 0.0
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
         scan:
           topic: scan
           max_obstacle_height: 2.0
@@ -298,7 +323,15 @@ global_costmap:
   global_costmap:
     ros__parameters:
       robot_base_frame: "ROBOT_NS/base_link"
-      robot_radius: 0.22
+      # Real body from robot_core.xacro: chassis x -0.10..0.45, base plate
+      # x +/-0.275, wheels y +/-0.245 (circumscribed radius ~0.53 m). The old
+      # robot_radius 0.22 let the chassis front hit shelves, so robots got
+      # stuck, wheels slipped and odometry/localization drifted by metres.
+      footprint: "[[0.46, 0.25], [0.46, -0.25], [-0.28, -0.25], [-0.28, 0.25]]"
+      # 10 cm safety margin: makes the 0.7 m gaps between rack segments
+      # impassable (robots clipped rack corners there, got stuck with the
+      # wheels spinning, and their odometry/pose drifted by metres).
+      footprint_padding: 0.1
       plugins: ["static_layer", "obstacle_layer", "inflation_layer", "keepout_filter", "speed_filter"]
       keepout_filter:
         plugin: "nav2_costmap_2d::KeepoutFilter"
@@ -319,7 +352,19 @@ global_costmap:
         unknown_threshold: 15
         mark_threshold: 0
         combination_method: 1
-        observation_sources: scan points depth
+        observation_sources: scan points depth fleet
+        fleet:
+          # Other robots' footprints (warehouse_marl fleet_obstacles_node): the
+          # lidars pass over the robot bodies, so robots are otherwise invisible
+          # to each other. Range is measured from the cloud's frame (map) origin.
+          topic: fleet_obstacles
+          clearing: False
+          marking: True
+          data_type: "PointCloud2"
+          obstacle_max_range: 60.0
+          obstacle_min_range: 0.0
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
         scan:
           topic: scan
           max_obstacle_height: 2.0
@@ -359,7 +404,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.55
+        inflation_radius: 0.70
       always_send_full_costmap: True
 
 map_server:
@@ -405,6 +450,7 @@ behavior_server:
       plugin: "nav2_behaviors::DriveOnHeading"
     wait:
       plugin: "nav2_behaviors::Wait"
+    local_frame: "ROBOT_NS/odom"
     global_frame: "ROBOT_NS/odom"
     robot_base_frame: "ROBOT_NS/base_link"
     transform_tolerance: 0.1
@@ -459,6 +505,9 @@ collision_monitor:
       min_points: 6
       visualize: False
       enabled: True
+    # Laser only. The fleet cloud (other robots) is in the costmaps; as a
+    # stop source here it deadlocked robots that met (missions 71 -> 11 ok)
+    # and spread one robot's localization error to the others.
     observation_sources: ["scan"]
     scan:
       type: "scan"

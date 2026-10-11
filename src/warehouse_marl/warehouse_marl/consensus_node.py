@@ -33,6 +33,7 @@ politique DRL (voir drl_allocator_node.py -> publish sur
 """
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -104,6 +105,13 @@ class ConsensusNode(Node):
         self.create_subscription(
             String, '/warehouse/tasks/status', self._on_task_status, 10
         )
+        # Conflict resolution: every agent hears every claim (including its
+        # own) and applies the same rule, so late bids cannot leave two
+        # robots believing they won the same task.
+        self.create_subscription(
+            String, '/warehouse/consensus/assignments', self._on_claim, 10
+        )
+        self.claims: Dict[str, Dict[str, float]] = {}
 
         # --- Publications ---
         self.bid_pub = self.create_publisher(String, '/warehouse/consensus/bids', 10)
@@ -175,6 +183,7 @@ class ConsensusNode(Node):
         if data['robot_id'] == self.robot_id:
             self.release_task(task_id)
         self.tasks.pop(task_id, None)
+        self.claims.pop(task_id, None)
         self.drl_bias.pop(task_id, None)
 
     # ------------------------------------------------------------------ #
@@ -233,7 +242,10 @@ class ConsensusNode(Node):
         msg = String()
         msg.data = json.dumps(payload)
         self.bid_pub.publish(msg)
-        self.tasks[task_id].bids[self.robot_id] = cost
+        task = self.tasks[task_id]
+        task.bids[self.robot_id] = cost
+        if math.isinf(task.deadline):
+            task.deadline = self._now() + self.bidding_window
 
     def _on_bid(self, msg: String):
         """Chaque agent ecoute TOUTES les encheres (y compris les siennes)
@@ -255,17 +267,44 @@ class ConsensusNode(Node):
                 deadline=self._now() + self.bidding_window,
                 bid_at=self._now() + self.bid_delay,
             )
-        self.tasks[task_id].bids[robot_id] = cost
+        task = self.tasks[task_id]
+        task.bids[robot_id] = cost
+        if math.isinf(task.deadline):
+            # Re-opened task: the first bid restarts the window everywhere.
+            task.deadline = self._now() + self.bidding_window
 
     # ------------------------------------------------------------------ #
+    def _open_bids(self) -> int:
+        return sum(1 for t in self.tasks.values()
+                   if t.assigned_to is None and self.robot_id in t.bids)
+
+    def _target_full(self, target_node: str) -> bool:
+        """Shelf capacity from the dynamic graph (1 robot per shelf, 2-4 at
+        stations). Every agent records every auction winner until the task
+        ends, so all agents count the same occupancy and make the same
+        decision. Two robots sent to one shelf block each other's paths."""
+        in_use = sum(1 for t in self.tasks.values()
+                     if t.assigned_to is not None and t.target_node == target_node)
+        if target_node in self.graph.G:
+            capacity = int(self.graph.G.nodes[target_node].get('capacity', 1))
+        else:
+            capacity = 1
+        return in_use >= capacity
+
     def _check_deadlines(self):
         now = self._now()
-        for task_id, task in list(self.tasks.items()):
+        # Highest priority first: a robot that frees up bids on the most
+        # important open task (e.g. an RFID scan of an uncertain shelf).
+        ordered = sorted(self.tasks.items(), key=lambda kv: -kv[1].priority)
+        for task_id, task in ordered:
             if task.assigned_to is not None or task.deadline == 0.0:
                 continue
+            # Capacity includes bids still pending, so a free robot bids on
+            # one open task at a time instead of winning all of them.
             if (self.robot_id not in task.bids and task.target_node != '?' and
                     now >= task.bid_at and
-                    len(self.active_tasks) < self.max_concurrent):
+                    len(self.active_tasks) + self._open_bids() < self.max_concurrent and
+                    not self._target_full(task.target_node)):
                 cost = self._compute_bid_cost(task.target_node, task_id)
                 if cost != float('inf'):
                     self._publish_bid(task_id, cost)
@@ -277,7 +316,11 @@ class ConsensusNode(Node):
             # pour garantir un resultat DETERMINISTE et IDENTIQUE chez
             # tous les agents, condition necessaire au consensus).
             if not task.bids:
-                del self.tasks[task_id]
+                # No agent was free: keep the task OPEN instead of dropping
+                # it. The first bid anyone publishes later restarts the
+                # window on every agent (_publish_bid / _on_bid), so all
+                # agents close the auction over the same bids.
+                task.deadline = math.inf
                 continue
 
             winner = min(task.bids.items(), key=lambda kv: (kv[1], kv[0]))[0]
@@ -296,11 +339,40 @@ class ConsensusNode(Node):
             'task_id': task.task_id,
             'robot_id': self.robot_id,
             'target_node': task.target_node,
+            'cost': task.bids.get(self.robot_id, float('inf')),
             'stamp': self._now(),
         }
+        # Record our own claim now: another agent's claim may arrive before
+        # our own message comes back, and we must not yield to a worse one.
+        self.claims.setdefault(task.task_id, {})[self.robot_id] = payload['cost']
         msg = String()
         msg.data = json.dumps(payload)
         self.assign_pub.publish(msg)
+
+    def _on_claim(self, msg: String):
+        """Phase de resolution des conflits du consensus : si plusieurs
+        agents ont revendique la meme tache (encheres recues trop tard), la
+        revendication de cout minimal (egalite -> robot_id) l'emporte chez
+        tous les agents ; les perdants se retirent."""
+        try:
+            data = json.loads(msg.data)
+            task_id, robot_id = data['task_id'], data['robot_id']
+            cost = float(data.get('cost', 0.0))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return
+        claims = self.claims.setdefault(task_id, {})
+        claims[robot_id] = cost
+        winner = min(claims.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        task = self.tasks.get(task_id)
+        if task is None:
+            task = TaskState(task_id=task_id, target_node=data.get('target_node', '?'))
+            self.tasks[task_id] = task
+        task.assigned_to = winner
+        if winner != self.robot_id and task_id in self.active_tasks:
+            self.release_task(task_id)
+            self.get_logger().info(
+                f"[{self.robot_id}] conflit sur {task_id} : cede a {winner} "
+                f"(cout {claims[winner]:.2f} < {claims.get(self.robot_id, float('inf')):.2f})")
 
     def release_task(self, task_id: str):
         """A appeler (ex: depuis fleet_manager / mission_server) quand le

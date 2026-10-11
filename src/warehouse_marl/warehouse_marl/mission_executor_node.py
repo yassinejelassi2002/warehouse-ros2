@@ -12,13 +12,14 @@ import json
 from typing import Deque, Dict, Optional
 
 import rclpy
-from action_msgs.msg import GoalStatus
+from action_msgs.msg import GoalStatus, GoalStatusArray
+from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, String
 
 from warehouse_marl.warehouse_graph import build_demo_warehouse
@@ -44,6 +45,9 @@ class MissionExecutorNode(Node):
         self.declare_parameter('dispatch_period_sec', 0.25)
         self.declare_parameter('max_retries', 1)
         self.declare_parameter('pause_exploration', True)
+        # Claims for one task are collected this long before dispatching the
+        # best one (cost, then robot_id), the same rule consensus_node uses.
+        self.declare_parameter('claim_window_sec', 0.5)
 
         self.robot_names = list(self.get_parameter('robot_names').value)
         self.max_retries = int(self.get_parameter('max_retries').value)
@@ -66,8 +70,29 @@ class MissionExecutorNode(Node):
         self._active: Dict[str, Optional[Mission]] = {
             robot: None for robot in self.robot_names
         }
+        # Goals another client (frontier exploration) is running on each robot.
+        # Nav2 refuses to preempt a goal that uses a different behavior tree,
+        # so a mission is only sent once the robot is idle (see _dispatch).
+        self._cancel_clients = {
+            robot: self.create_client(
+                CancelGoal, f'/{robot}/navigate_to_pose/_action/cancel_goal')
+            for robot in self.robot_names
+        }
+        self._nav_busy = {robot: False for robot in self.robot_names}
+        self._cancel_sent = {robot: False for robot in self.robot_names}
+        status_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        for robot in self.robot_names:
+            self.create_subscription(
+                GoalStatusArray, f'/{robot}/navigate_to_pose/_action/status',
+                lambda msg, r=robot: self._on_nav_status(r, msg), status_qos)
         self._task_metadata = {}
         self._claimed_tasks = set()
+        self.claim_window = float(self.get_parameter('claim_window_sec').value)
+        self._pending_claims: Dict[str, dict] = {}
         self._last_server_warning = {robot: -float('inf') for robot in self.robot_names}
         self._missions_active = None
 
@@ -128,6 +153,31 @@ class MissionExecutorNode(Node):
                 detail='unknown target node')
             return
 
+        try:
+            cost = float(data.get('cost', 0.0))
+        except (TypeError, ValueError):
+            cost = 0.0
+        pending = self._pending_claims.setdefault(
+            task_id, {'first': self._now(), 'claims': {}})
+        pending['claims'][robot_id] = (cost, target_node)
+
+    def _resolve_claims(self):
+        """Dispatch each task to its best claim once the claim window has
+        passed, so simultaneous claims from late auctions cannot send two
+        robots (or the wrong one) to the same task."""
+        now = self._now()
+        for task_id, pending in list(self._pending_claims.items()):
+            if now - pending['first'] < self.claim_window:
+                continue
+            del self._pending_claims[task_id]
+            claims = pending['claims']
+            robot_id = min(claims, key=lambda r: (claims[r][0], r))
+            if len(claims) > 1:
+                self.get_logger().info(
+                    f'{task_id}: {len(claims)} revendications, retenu {robot_id}.')
+            self._queue_mission(task_id, robot_id, claims[robot_id][1])
+
+    def _queue_mission(self, task_id: str, robot_id: str, target_node: str):
         metadata = self._task_metadata.get(task_id, {})
         mission = Mission(
             task_id=task_id,
@@ -142,7 +192,15 @@ class MissionExecutorNode(Node):
         self.get_logger().info(
             f'{task_id} en file pour {robot_id} -> {target_node}.')
 
+    def _on_nav_status(self, robot_id: str, msg: GoalStatusArray):
+        busy_states = (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING,
+                       GoalStatus.STATUS_CANCELING)
+        self._nav_busy[robot_id] = any(s.status in busy_states for s in msg.status_list)
+        if not self._nav_busy[robot_id]:
+            self._cancel_sent[robot_id] = False
+
     def _dispatch(self):
+        self._resolve_claims()
         for robot_id in self.robot_names:
             if self._active[robot_id] is not None or not self._queues[robot_id]:
                 continue
@@ -153,6 +211,17 @@ class MissionExecutorNode(Node):
                     self.get_logger().warn(
                         f'Attend /{robot_id}/navigate_to_pose.')
                     self._last_server_warning[robot_id] = now
+                continue
+
+            if self._nav_busy[robot_id]:
+                # An exploration goal is still running: cancel every goal on
+                # this robot once, then wait until Nav2 reports it idle.
+                if not self._cancel_sent[robot_id] and \
+                        self._cancel_clients[robot_id].service_is_ready():
+                    self._cancel_clients[robot_id].call_async(CancelGoal.Request())
+                    self._cancel_sent[robot_id] = True
+                    self.get_logger().info(
+                        f'{robot_id}: annule l objectif en cours avant la mission.')
                 continue
 
             mission = self._queues[robot_id].popleft()

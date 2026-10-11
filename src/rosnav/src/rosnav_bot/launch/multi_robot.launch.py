@@ -271,6 +271,7 @@ def _safe_spawns(
     world_path: str,
     validate_spawns: bool,
     robot_clearance: float,
+    robot_min_gap: float,
     search_radius: float,
     search_step: float,
 ) -> tuple[list[dict], list[str]]:
@@ -289,7 +290,7 @@ def _safe_spawns(
         x = float(robot['x'])
         y = float(robot['y'])
         nx, ny = _nearest_free_spawn(
-            x, y, obstacles, spawn_areas, placed, robot_clearance,
+            x, y, obstacles, spawn_areas, placed, robot_clearance, robot_min_gap,
             search_radius, search_step)
         if (round(nx, 4), round(ny, 4)) != (round(x, 4), round(y, 4)):
             adjusted.append(
@@ -309,10 +310,11 @@ def _nearest_free_spawn(
     spawn_areas: list[dict],
     placed: list[tuple[float, float]],
     clearance: float,
+    min_gap: float,
     search_radius: float,
     search_step: float,
 ) -> tuple[float, float]:
-    if _is_spawn_free(x, y, obstacles, spawn_areas, placed, clearance):
+    if _is_spawn_free(x, y, obstacles, spawn_areas, placed, clearance, min_gap):
         return x, y
 
     step = max(0.05, search_step)
@@ -324,7 +326,7 @@ def _nearest_free_spawn(
             angle = 2.0 * math.pi * i / samples
             cx = x + radius * math.cos(angle)
             cy = y + radius * math.sin(angle)
-            if _is_spawn_free(cx, cy, obstacles, spawn_areas, placed, clearance):
+            if _is_spawn_free(cx, cy, obstacles, spawn_areas, placed, clearance, min_gap):
                 return cx, cy
     raise RuntimeError(
         f'No free spawn found near ({x:.2f}, {y:.2f}) within {search_radius:.2f} m')
@@ -337,11 +339,15 @@ def _is_spawn_free(
     spawn_areas: list[dict],
     placed: list[tuple[float, float]],
     clearance: float,
+    min_gap: float = 0.0,
 ) -> bool:
     if spawn_areas and not any(_point_in_box(x, y, area, -clearance) for area in spawn_areas):
         return False
+    # Robots turn in place on a ~0.53 m radius (0.74 x 0.5 m body): neighbours
+    # closer than min_gap hit each other at start-up, which corrupts their
+    # odometry (a pushed robot moves without its wheels turning).
     for px, py in placed:
-        if math.hypot(x - px, y - py) < clearance * 2.0:
+        if math.hypot(x - px, y - py) < max(clearance * 2.0, min_gap):
             return False
     for obs in obstacles:
         if obs['kind'] == 'cylinder':
@@ -633,6 +639,7 @@ def _build_all(context, pkg_share: str):
     spawn_spacing = float(LaunchConfiguration('spawn_spacing').perform(context).strip())
     validate_spawns = _truthy(LaunchConfiguration('validate_spawns').perform(context))
     robot_clearance = float(LaunchConfiguration('robot_clearance').perform(context).strip())
+    robot_min_gap = float(LaunchConfiguration('robot_min_gap').perform(context).strip())
     spawn_search_radius = float(LaunchConfiguration('spawn_search_radius').perform(context).strip())
     spawn_search_step = float(LaunchConfiguration('spawn_search_step').perform(context).strip())
     nav2_start_delay = float(LaunchConfiguration('nav2_start_delay').perform(context).strip())
@@ -725,7 +732,7 @@ def _build_all(context, pkg_share: str):
         robot_count, robot_layout, spawn_x, spawn_y, spawn_z, spawn_yaw,
         spawn_spacing, robots_json)
     robots, spawn_adjustments = _safe_spawns(
-        robots, world_path, validate_spawns, robot_clearance,
+        robots, world_path, validate_spawns, robot_clearance, robot_min_gap,
         spawn_search_radius, spawn_search_step)
 
     actions = [
@@ -757,6 +764,16 @@ def _build_all(context, pkg_share: str):
         name='clock_bridge',
         arguments=['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock'],
         output='screen'))
+
+    # Fleet awareness: the lidars pass over the other robots' bodies, so each
+    # robot gets the others' footprints as a point cloud for its costmaps.
+    actions.append(Node(
+        package='rosnav_bot',
+        executable='fleet_obstacles.py',
+        name='fleet_obstacles',
+        output='screen',
+        parameters=[{'use_sim_time': True,
+                     'robot_names': [r['name'] for r in robots]}]))
 
     # Bridge Gazebo's global TF exactly once. The Gazebo /tf stream already
     # contains all spawned robots, so duplicating this bridge per-robot causes
@@ -841,6 +858,18 @@ def _build_all(context, pkg_share: str):
     else:
         # Static map_server
         resolved_map = _resolve_map_file(map_arg, world_path, pkg_share)
+        if not os.path.isfile(resolved_map):
+            # No saved map: build a complete one from the world SDF (exact
+            # floor plan), with the map origin at robot1's spawn like the
+            # AMCL initial poses below.
+            sys.path.insert(0, os.path.join(pkg_share, '..', '..', 'lib', 'rosnav_bot'))
+            import world_to_map  # noqa: E402
+            out = os.path.join(os.path.expanduser('~'), '.ros', 'rosnav_maps',
+                               f'{world_stem}_from_sdf')
+            resolved_map = world_to_map.build(
+                world_path, out, (float(robots[0]['x']), float(robots[0]['y'])))
+            actions.append(LogInfo(
+                msg=f'[multi_robot] no saved map: generated {resolved_map} from the world SDF'))
         actions += [
             LogInfo(msg=f'[multi_robot] static map = {resolved_map}'),
             Node(
@@ -1077,6 +1106,23 @@ def _build_all(context, pkg_share: str):
             slam_actions = []
             if slam_mode == 'multi':
                 slam_actions.append(TimerAction(period=6.0 + robot_stagger, actions=[slam_node]))
+                if slam_algo == '2d' and ROS_DISTRO != 'humble':
+                    # Jazzy+ slam_toolbox is a lifecycle node: started as a plain
+                    # Node it stays 'unconfigured' (no map, no map->odom TF).
+                    slam_actions.append(TimerAction(
+                        period=8.0 + robot_stagger,
+                        actions=[Node(
+                            package='nav2_lifecycle_manager',
+                            executable='lifecycle_manager',
+                            name='lifecycle_manager_slam',
+                            namespace=ns,
+                            output='screen',
+                            parameters=[{
+                                'use_sim_time': True,
+                                'autostart': True,
+                                'bond_timeout': 0.0,
+                                'node_names': ['slam_toolbox'],
+                            }])]))
                 if run_cslam:
                     slam_actions.append(TimerAction(
                         period=8.0 + robot_stagger,
@@ -1417,6 +1463,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'robot_clearance', default_value='0.45',
             description='Minimum spawn clearance from walls/obstacles and other robots'),
+        DeclareLaunchArgument(
+            'robot_min_gap', default_value='1.2',
+            description='Minimum distance between two robot spawns (m); robots '
+                        'turning in place need ~1.1 m so they do not collide.'),
         DeclareLaunchArgument(
             'spawn_search_radius', default_value='4.0',
             description='Maximum radius to search when relocating blocked spawns'),

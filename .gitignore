@@ -6,3 +6,9 @@ __pycache__/
 .vscode/
 .idea/
 .venv/
+
+# Local test files (not part of the delivered packages)
+src/warehouse_marl/test/test_rfid_model.py
+.pytest_cache/
+src/warehouse_marl/doc/rfid_offline_*
+src/warehouse_marl/doc/rfid_gazebo_*

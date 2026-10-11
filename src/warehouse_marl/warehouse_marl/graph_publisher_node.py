@@ -128,6 +128,8 @@ class GraphPublisherNode(Node):
             self.get_logger().warn("Message RFID mal forme, ignore.")
             return
 
+        if data.get('kind', 'location') != 'location':
+            return  # seuls les tags de localisation recalent la position
         if node_id not in self.graph.G.nodes:
             return
 

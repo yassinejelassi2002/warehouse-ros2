@@ -48,12 +48,28 @@ class TaskGeneratorNode(Node):
         # SLAM cells to be known around a target rejected safe goals merely
         # because a few cells at the outer fringe were still unknown.
         self.declare_parameter('target_clearance_m', 0.25)
+        # Choix des racks de picking : croyance RFID (true) ou enregistrements
+        # WMS seuls (false, reference pour l'evaluation experimentale).
+        self.declare_parameter('use_rfid_inventory', True)
+        # Demande de type Zipf par rack (0 = uniforme). Une demande
+        # concentree laisse des racks rarement visites, dont l'inventaire
+        # vieillit : c'est la que les missions de scan RFID sont utiles.
+        self.declare_parameter('demand_skew', 0.0)
+        # Liberation progressive des ordres (comme un WMS) : pas de nouvelle
+        # tache de picking tant que ce nombre de taches est deja ouvert. Les
+        # missions de scan RFID ne sont pas limitees.
+        self.declare_parameter('max_open_tasks', 6)
 
         self.mean_period = self.get_parameter('mean_period_sec').value
         self.priority_min = self.get_parameter('priority_min').value
         self.priority_max = self.get_parameter('priority_max').value
         random.seed(self.get_parameter('seed').value)
 
+        self.use_rfid_inventory = bool(
+            self.get_parameter('use_rfid_inventory').value)
+        self._inventory = {}
+        self.max_open_tasks = int(self.get_parameter('max_open_tasks').value)
+        self._open_tasks = {}  # task_id -> creation time
         self.only_mapped_targets = bool(
             self.get_parameter('only_mapped_targets').value)
         self.target_clearance = float(
@@ -65,6 +81,11 @@ class TaskGeneratorNode(Node):
         self.shelf_nodes = [
             n for n, d in self.graph.G.nodes(data=True) if d['node_type'] == 'shelf'
         ]
+        skew = float(self.get_parameter('demand_skew').value)
+        ranking = self.shelf_nodes[:]
+        random.shuffle(ranking)
+        self._demand_weight = {
+            shelf: 1.0 / (rank + 1) ** skew for rank, shelf in enumerate(ranking)}
 
         self.task_pub = self.create_publisher(String, '/warehouse/tasks/new', 10)
         self._map = None
@@ -82,6 +103,12 @@ class TaskGeneratorNode(Node):
             self.create_subscription(
                 OccupancyGrid, fallback_map_topic,
                 lambda msg: self._on_map(msg, primary=False), map_qos)
+        self.create_subscription(
+            String, '/rfid/inventory', self._on_inventory, 10)
+        self.create_subscription(
+            String, '/rfid/scan_requests', self._on_scan_request, 10)
+        self.create_subscription(
+            String, '/warehouse/tasks/status', self._on_task_status, 50)
         self._task_timer = None
         self._last_wait_warning = -float('inf')
         self._schedule_next()
@@ -117,6 +144,50 @@ class TaskGeneratorNode(Node):
         elif not self._primary_map_received:
             self._map = msg
 
+    def _on_inventory(self, msg: String):
+        try:
+            self._inventory = json.loads(msg.data).get('shelves', {})
+        except json.JSONDecodeError:
+            pass
+
+    def _on_task_status(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if data.get('state') in ('succeeded', 'failed', 'rejected', 'canceled'):
+            self._open_tasks.pop(data.get('task_id'), None)
+
+    def _stocked(self, shelf: str) -> bool:
+        """Le rack contient-il des articles a prelever ? Sans donnees
+        d'inventaire, tous les racks sont consideres approvisionnes."""
+        info = self._inventory.get(shelf)
+        if info is None:
+            return True
+        key = 'stock' if self.use_rfid_inventory else 'wms_stock'
+        return info.get(key, 0) > 0
+
+    def _on_scan_request(self, msg: String):
+        """Decision adaptative : l'inventaire d'un rack est incertain ou
+        ancien -> mission de scan RFID, attribuee par consensus comme les
+        autres taches."""
+        try:
+            data = json.loads(msg.data)
+            shelf = data['shelf']
+        except (json.JSONDecodeError, KeyError):
+            return
+        if shelf not in self.shelf_nodes:
+            return
+        # An operator request (dashboard) is always honoured; automatic
+        # requests wait until the shelf's service point is mapped and free.
+        if data.get('source') != 'dashboard' and not self._mapped_free(shelf):
+            self.get_logger().info(
+                f'Scan RFID de {shelf} differe : point de service pas encore cartographie.')
+            return
+        score = float(data.get('score', 2.0))
+        priority = round(min(self.priority_max, max(self.priority_min, score / 2.0)), 2)
+        self._publish_task(shelf, priority, 'rfid_scan')
+
     def _mapped_free(self, node_id: str) -> bool:
         if not self.only_mapped_targets:
             return True
@@ -140,22 +211,32 @@ class TaskGeneratorNode(Node):
         return True
 
     def _emit_task(self):
-        candidates = [n for n in self.shelf_nodes if self._mapped_free(n)]
+        now = self.get_clock().now().nanoseconds / 1e9
+        # A task that never reports a final state must not block releases.
+        self._open_tasks = {t: c for t, c in self._open_tasks.items() if now - c < 300.0}
+        if len(self._open_tasks) >= self.max_open_tasks:
+            return
+        candidates = [n for n in self.shelf_nodes
+                      if self._mapped_free(n) and self._stocked(n)]
         if not candidates:
             now = self.get_clock().now().nanoseconds / 1e9
             if now - self._last_wait_warning >= 10.0:
                 self.get_logger().warn(
-                    'Aucun point de picking libre n est encore visible sur la carte; '
+                    'Aucun rack approvisionne et visible sur la carte; '
                     'generation de tache differee.')
                 self._last_wait_warning = now
             return
 
-        target = random.choice(candidates)
+        target = random.choices(
+            candidates, weights=[self._demand_weight[c] for c in candidates])[0]
         priority = round(random.uniform(self.priority_min, self.priority_max), 2)
-        task_id = f"task_{uuid.uuid4().hex[:8]}"
+        self._publish_task(target, priority, 'pick')
 
+    def _publish_task(self, target: str, priority: float, task_type: str):
+        task_id = f"task_{uuid.uuid4().hex[:8]}"
         payload = {
             'task_id': task_id,
+            'task_type': task_type,
             'target_node': target,
             'priority': priority,
             'created_at': self.get_clock().now().nanoseconds / 1e9,
@@ -163,8 +244,9 @@ class TaskGeneratorNode(Node):
         msg = String()
         msg.data = json.dumps(payload)
         self.task_pub.publish(msg)
+        self._open_tasks[task_id] = payload['created_at']
         self.get_logger().info(
-            f"Nouvelle tache {task_id} -> {target} (priorite {priority})"
+            f"Nouvelle tache {task_id} ({task_type}) -> {target} (priorite {priority})"
         )
 
 

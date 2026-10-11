@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="fr" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Entrepot RFID</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">W</span>
+        <div><strong>Warehouse MARL</strong><small>RFID · consensus · Nav2</small></div>
+      </div>
+      <nav>
+        <p class="nav-group">Operations</p>
+        <button class="nav-item active" data-view="overview"><span class="ico">◧</span>Vue d'ensemble</button>
+        <button class="nav-item" data-view="map"><span class="ico">⌖</span>Carte en direct</button>
+        <button class="nav-item" data-view="missions"><span class="ico">≡</span>Missions &amp; consensus</button>
+        <p class="nav-group">RFID</p>
+        <button class="nav-item" data-view="reads"><span class="ico">▦</span>Lectures RFID</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="conn" class="pill pill-off"><i></i><span>Connexion…</span></span>
+        <small id="world-name"></small>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="view-eyebrow">Operations</p>
+          <h1 id="view-title">Vue d'ensemble</h1>
+        </div>
+        <div class="topbar-right">
+          <span class="clock" id="sim-clock">—</span>
+        </div>
+      </header>
+
+      <!-- Vue d'ensemble -->
+      <section class="view active" id="view-overview">
+        <div class="kpi-row" id="kpis"></div>
+        <div class="grid-overview">
+          <article class="card map-card">
+            <header class="card-head"><h3>Entrepot en direct</h3><span class="muted" id="ov-map-meta"></span></header>
+            <div class="map-wrap" id="ov-map"></div>
+          </article>
+          <article class="card">
+            <header class="card-head"><h3>Lectures RFID</h3><span class="muted">tags lus par seconde</span></header>
+            <div id="ov-chart" class="chart"></div>
+            <div class="legend-inline"><span class="lg lg-rfid"></span>Lectures RFID par seconde (toute la flotte)</div>
+          </article>
+          <article class="card">
+            <header class="card-head"><h3>Flotte</h3><span class="muted" id="fleet-meta"></span></header>
+            <div id="ov-fleet" class="fleet"></div>
+          </article>
+          <article class="card">
+            <header class="card-head"><h3>Activite</h3><span class="muted">temps reel</span></header>
+            <ul id="ov-activity" class="feed"></ul>
+          </article>
+        </div>
+      </section>
+
+      <!-- Carte -->
+      <section class="view" id="view-map">
+        <div class="toolbar">
+          <div class="toggle-group" id="map-toggles">
+            <label><input type="checkbox" data-layer="tags" checked> Tags RFID</label>
+            <label><input type="checkbox" data-layer="beams" checked> Lectures en cours</label>
+            <label><input type="checkbox" data-layer="trails" checked> Trajectoires</label>
+            <label><input type="checkbox" data-layer="graph"> Graphe</label>
+          </div>
+          <div class="legend" id="map-legend">
+            <span><i class="sw sw-ok"></i>Scanne il y a moins de 30 s</span>
+            <span><i class="sw sw-old"></i>Pas scanne recemment</span>
+            <span><i class="sw sw-scan"></i>Scan demande</span>
+            <span><i class="dot-tag"></i>Tag lu a l'instant</span>
+          </div>
+        </div>
+        <div class="grid-map">
+          <article class="card map-card big">
+            <div class="map-wrap" id="main-map"></div>
+          </article>
+          <aside class="card inspector" id="inspector"></aside>
+        </div>
+      </section>
+
+      <!-- Missions -->
+      <section class="view" id="view-missions">
+        <div class="kpi-row" id="mission-kpis"></div>
+        <div class="grid-two">
+          <article class="card">
+            <header class="card-head"><h3>Taches</h3><span class="muted">attribuees par consensus</span></header>
+            <div class="table-wrap"><table class="table" id="task-table"></table></div>
+          </article>
+          <article class="card">
+            <header class="card-head"><h3>Consensus</h3><span class="muted">encheres, revendications, conflits</span></header>
+            <ul id="consensus-feed" class="feed"></ul>
+          </article>
+        </div>
+      </section>
+
+      <!-- Lectures RFID -->
+      <section class="view" id="view-reads">
+        <div class="kpi-row" id="reads-kpis"></div>
+        <div class="grid-two">
+          <article class="card">
+            <header class="card-head"><h3>Racks</h3><span class="muted">tags et lectures par rack</span></header>
+            <div class="table-wrap"><table class="table" id="rack-table"></table></div>
+          </article>
+          <article class="card">
+            <header class="card-head"><h3>Lectures en direct</h3><span class="muted">dernieres lectures des robots</span></header>
+            <ul id="reads-feed" class="feed"></ul>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div id="toast" class="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

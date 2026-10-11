@@ -8,17 +8,18 @@ Usage typique (2 terminaux) :
 
     # Terminal 1 - simulation + navigation (package rosnav) :
     ros2 launch rosnav_bot multi_robot.launch.py \\
-        world:=warehouse robot_count:=2 explore:=true fleet_mgmt:=false
+        world:=warehouse robot_count:=4 explore:=true fleet_mgmt:=false
 
     # Terminal 2 - couche coordination multi-agents (ce package) :
     ros2 launch warehouse_marl warehouse_marl.launch.py \\
-        robot_names:="['robot1','robot2']" drl_mode:=heuristic \\
+        robot_names:="['robot1','robot2','robot3','robot4']" drl_mode:=heuristic \\
         map_origin_x:=-1.5 map_origin_y:=-1.0
 
 Ce launch file demarre, pour N robots :
     - 1x graph_publisher_node       (etat partage du graphe dynamique)
     - 1x rfid_sensor_node           (couche capteurs RFID/IoT simulee)
     - 1x task_generator_node        (flux de commandes a traiter)
+    - 1x inventory_node             (inventaire RFID probabiliste, scans)
     - 1x mission_executor_node      (assignations -> actions Nav2)
     - Nx consensus_node             (heuristic/hybrid seulement)
     - 1x drl_allocator_node         (hybrid/direct seulement)
@@ -46,6 +47,9 @@ def launch_setup(context, *args, **kwargs):
     map_origin_x = float(LaunchConfiguration('map_origin_x').perform(context))
     map_origin_y = float(LaunchConfiguration('map_origin_y').perform(context))
     map_topic = LaunchConfiguration('map_topic').perform(context)
+    use_rfid_inventory = LaunchConfiguration('use_rfid_inventory').perform(context).lower() == 'true'
+    rfid_drift_period = float(LaunchConfiguration('rfid_drift_period').perform(context))
+    demand_skew = float(LaunchConfiguration('demand_skew').perform(context))
     if drl_mode not in ('heuristic', 'hybrid', 'direct'):
         raise ValueError('drl_mode must be heuristic, hybrid, or direct')
 
@@ -70,7 +74,16 @@ def launch_setup(context, *args, **kwargs):
         executable='rfid_sensor_node',
         name='rfid_sensor_node',
         output='screen',
-        parameters=[{**common, 'robot_names': robot_names}],
+        parameters=[{**common, 'robot_names': robot_names,
+                     'drift_period_sec': rfid_drift_period}],
+    ))
+
+    nodes.append(Node(
+        package='warehouse_marl',
+        executable='inventory_node',
+        name='inventory_node',
+        output='screen',
+        parameters=[common],
     ))
 
     nodes.append(Node(
@@ -78,7 +91,9 @@ def launch_setup(context, *args, **kwargs):
         executable='task_generator_node',
         name='task_generator_node',
         output='screen',
-        parameters=[{**common, 'map_topic': map_topic}],
+        parameters=[{**common, 'map_topic': map_topic,
+                     'use_rfid_inventory': use_rfid_inventory,
+                     'demand_skew': demand_skew}],
     ))
 
     if drl_mode in ('hybrid', 'direct'):
@@ -120,7 +135,7 @@ def launch_setup(context, *args, **kwargs):
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
-            'robot_names', default_value="['robot1','robot2']",
+            'robot_names', default_value="['robot1','robot2','robot3','robot4']",
             description="Liste des noms de robots, ex: \"['robot1','robot2']\""
         ),
         DeclareLaunchArgument(
@@ -138,6 +153,18 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'map_origin_y', default_value='-1.0',
             description="Coordonnee Gazebo y de l origine map (spawn robot1)"
+        ),
+        DeclareLaunchArgument(
+            'use_rfid_inventory', default_value='true',
+            description="Picking selon la croyance RFID (true) ou le WMS seul (false)"
+        ),
+        DeclareLaunchArgument(
+            'rfid_drift_period', default_value='20.0',
+            description="Secondes entre deux evenements d'inventaire non enregistres (0 = aucun)"
+        ),
+        DeclareLaunchArgument(
+            'demand_skew', default_value='0.0',
+            description="Exposant Zipf de la demande par rack (0 = uniforme)"
         ),
         DeclareLaunchArgument(
             'map_topic', default_value='/map_fused',

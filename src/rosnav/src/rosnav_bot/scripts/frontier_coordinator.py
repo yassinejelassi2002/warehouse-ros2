@@ -65,6 +65,7 @@ import numpy as np
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 import tf2_ros
 
@@ -192,7 +193,20 @@ class FrontierCoordinator(Node):
             self._bt_xml = ''
 
         self._tf = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf, self)
+        # TF intake runs on its own node and thread with a deep queue. A frontier
+        # cycle can block this node's executor for seconds with 4+ robots; a
+        # depth-100 /tf queue then keeps under 0.5 s of traffic, so low-rate
+        # AMCL map -> robotN/odom transforms were dropped and that robot never
+        # became TF-ready (never received an exploration goal).
+        # use_global_arguments=False: the launch's __node:= remap would
+        # otherwise rename this node to the coordinator's own name.
+        self._tf_node = rclpy.create_node(
+            f'{self.get_name()}_tf',
+            use_global_arguments=False,
+            parameter_overrides=[Parameter(
+                'use_sim_time', value=self.get_parameter('use_sim_time').value)])
+        self._tf_listener = tf2_ros.TransformListener(
+            self._tf, self._tf_node, qos=QoSProfile(depth=1000), spin_thread=True)
 
         self._map: OccupancyGrid | None = None
         self._costmaps: dict[str, OccupancyGrid | None] = {r: None for r in self._robots}
@@ -1169,6 +1183,8 @@ def main(args=None):
         pass
     finally:
         try:
+            node._tf_listener.unregister()
+            node._tf_node.destroy_node()
             node.destroy_node()
         except (KeyError, Exception):
             pass  # Humble rclpy KeyError on ActionClient cleanup

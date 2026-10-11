@@ -49,6 +49,9 @@ slam_toolbox:
     loop_match_minimum_response_coarse: 0.35
     loop_match_minimum_response_fine: 0.45
 
+    # Keep +/-0.25 m: +/-0.6 m (tried 2026-10-11) let scan matching slide ~1 m
+    # along long walls / identical racks. Pushes are prevented instead (spawn
+    # gap, footprint padding, collision monitor).
     correlation_search_space_dimension: 0.5
     correlation_search_space_resolution: 0.01
     correlation_search_space_smear_deviation: 0.1

@@ -16,6 +16,8 @@ setup(
             glob(os.path.join('launch', '*.launch.py'))),
         (os.path.join('share', package_name, 'config'),
             glob(os.path.join('config', '*.yaml'))),
+        (os.path.join('share', package_name, 'dashboard'),
+            glob(os.path.join('dashboard', '*'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -38,6 +40,14 @@ setup(
             'drl_allocator_node = warehouse_marl.drl_allocator_node:main',
             'task_generator_node = warehouse_marl.task_generator_node:main',
             'mission_executor_node = warehouse_marl.mission_executor_node:main',
+            'lifecycle_watchdog_node = warehouse_marl.lifecycle_watchdog_node:main',
+            # Couche RFID : inventaire probabiliste + evaluation
+            'inventory_node = warehouse_marl.inventory_node:main',
+            'rfid_metrics_logger = warehouse_marl.rfid_metrics_logger:main',
+            'rfid_offline_experiment = warehouse_marl.rfid_experiment:offline_main',
+            'plot_rfid_metrics = warehouse_marl.rfid_experiment:plot_main',
+            # Tableau de bord web (carte, RFID, missions)
+            'warehouse_dashboard = warehouse_marl.dashboard_server:main',
             # Entrainement hors-ligne du modele DRL (pas un noeud ROS2)
             'train_drl = warehouse_marl.drl.train_drl:main',
         ],
